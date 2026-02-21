@@ -54,6 +54,13 @@ docker compose logs -f
 3. 봇 응답으로 등록 결과 확인
 4. NAS Download Station에서 다운로드 확인
 
+명령어:
+
+- `/id`: 현재 채팅 ID 확인
+- `/stat`: Download Station 상태 요약
+- `/task`: 다운로드 진행 상황(진행중 작업 우선)
+- `/help`: 사용법 보기
+
 ## 보안 권장
 
 - NAS 관리자 계정 대신 전용 계정 사용

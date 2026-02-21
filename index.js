@@ -39,6 +39,97 @@ function extractMagnets(text) {
   return [...new Set(matches)];
 }
 
+function toNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function formatBytes(bytes) {
+  const value = toNumber(bytes, 0);
+  if (value <= 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let scaled = value;
+  let unitIdx = 0;
+
+  while (scaled >= 1024 && unitIdx < units.length - 1) {
+    scaled /= 1024;
+    unitIdx += 1;
+  }
+
+  const precision = scaled >= 100 || unitIdx === 0 ? 0 : 1;
+  return `${scaled.toFixed(precision)} ${units[unitIdx]}`;
+}
+
+function formatSpeed(bytesPerSec) {
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function formatPercent(ratio) {
+  const num = toNumber(ratio, 0);
+  const clamped = Math.min(1, Math.max(0, num));
+  return `${(clamped * 100).toFixed(1)}%`;
+}
+
+function shortenText(text, limit = 46) {
+  if (!text) return "이름없음";
+  if (text.length <= limit) return text;
+  if (limit <= 3) return text.slice(0, limit);
+  return `${text.slice(0, limit - 3)}...`;
+}
+
+function taskStatusLabel(status) {
+  const map = {
+    waiting: "대기",
+    downloading: "다운로드중",
+    paused: "일시정지",
+    finishing: "마무리중",
+    hashing: "해시검사중",
+    hash_checking: "해시검사중",
+    checking: "검사중",
+    seeding: "시딩중",
+    finished: "완료",
+    error: "오류",
+    extracting: "압축해제중",
+    filehosting_waiting: "호스팅대기",
+    filehosting_downloading: "호스팅다운로드",
+  };
+  return map[status] || status || "알수없음";
+}
+
+function taskSortTime(task) {
+  return toNumber(task?.additional?.detail?.create_time, 0);
+}
+
+function taskSize(task) {
+  return toNumber(task?.size, 0);
+}
+
+function taskDownloaded(task) {
+  return toNumber(task?.additional?.transfer?.size_downloaded, 0);
+}
+
+function taskDownloadSpeed(task) {
+  return toNumber(task?.additional?.transfer?.speed_download, 0);
+}
+
+function taskUploadSpeed(task) {
+  return toNumber(task?.additional?.transfer?.speed_upload, 0);
+}
+
+const ACTIVE_STATUSES = new Set([
+  "waiting",
+  "downloading",
+  "finishing",
+  "hashing",
+  "hash_checking",
+  "checking",
+  "seeding",
+  "extracting",
+  "filehosting_waiting",
+  "filehosting_downloading",
+]);
+
 class SynologyDownloadStation {
   constructor(options) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -174,6 +265,57 @@ class SynologyDownloadStation {
     });
   }
 
+  async listTasks(options = {}) {
+    const offset = toNumber(options.offset, 0);
+    const limit = Math.max(1, toNumber(options.limit, 50));
+
+    return this.runWithRetry(async () => {
+      const { task } = await this.queryApiInfo();
+      const query = new URLSearchParams({
+        api: "SYNO.DownloadStation.Task",
+        version: String(task.maxVersion),
+        method: "list",
+        offset: String(offset),
+        limit: String(limit),
+        additional: "detail,transfer",
+        _sid: this.sid,
+      });
+
+      const response = await this.http.get(`/webapi/${task.path}?${query.toString()}`);
+      this.assertHttpOk(response, "작업 목록 조회 실패");
+      this.assertSynologySuccess(response.data, "작업 목록 조회 실패");
+      return response.data?.data || { tasks: [], total: 0 };
+    });
+  }
+
+  async getTaskSnapshot(maxTasks = 200) {
+    const safeMax = Math.max(1, toNumber(maxTasks, 200));
+    const pageSize = 50;
+    const tasks = [];
+    let offset = 0;
+    let total = 0;
+
+    while (tasks.length < safeMax) {
+      const data = await this.listTasks({
+        offset,
+        limit: Math.min(pageSize, safeMax - tasks.length),
+      });
+      const page = Array.isArray(data.tasks) ? data.tasks : [];
+      total = Math.max(total, toNumber(data.total, page.length));
+      tasks.push(...page);
+
+      if (page.length === 0 || tasks.length >= total) {
+        break;
+      }
+      offset += page.length;
+    }
+
+    return {
+      total: Math.max(total, tasks.length),
+      tasks,
+    };
+  }
+
   async runWithRetry(action) {
     await this.login();
     try {
@@ -225,6 +367,8 @@ async function main() {
     "",
     "명령어:",
     "/id - 현재 채팅 ID 확인",
+    "/stat - Download Station 상태 요약",
+    "/task - 다운로드 진행 상황",
     "/help - 사용법 보기",
   ].join("\n");
 
@@ -239,19 +383,21 @@ async function main() {
     );
   }
 
-  bot.start(async (ctx) => {
+  async function ensureAuthorized(ctx) {
     if (!isAuthorized(ctx.chat.id)) {
       await rejectUnauthorized(ctx);
-      return;
+      return false;
     }
+    return true;
+  }
+
+  bot.start(async (ctx) => {
+    if (!(await ensureAuthorized(ctx))) return;
     await ctx.reply(usage);
   });
 
   bot.command("help", async (ctx) => {
-    if (!isAuthorized(ctx.chat.id)) {
-      await rejectUnauthorized(ctx);
-      return;
-    }
+    if (!(await ensureAuthorized(ctx))) return;
     await ctx.reply(usage);
   });
 
@@ -259,13 +405,111 @@ async function main() {
     await ctx.reply(`chat_id: ${ctx.chat.id}`);
   });
 
+  bot.command("stat", async (ctx) => {
+    if (!(await ensureAuthorized(ctx))) return;
+
+    try {
+      const snapshot = await synology.getTaskSnapshot(200);
+      const tasks = snapshot.tasks || [];
+      const counts = {};
+      let totalDownloadSpeed = 0;
+      let totalUploadSpeed = 0;
+
+      for (const task of tasks) {
+        const status = task.status || "unknown";
+        counts[status] = (counts[status] || 0) + 1;
+        totalDownloadSpeed += taskDownloadSpeed(task);
+        totalUploadSpeed += taskUploadSpeed(task);
+      }
+
+      const activeCount = tasks.filter((task) => ACTIVE_STATUSES.has(task.status)).length;
+      const downloadingCount = counts.downloading || 0;
+      const waitingCount = counts.waiting || 0;
+      const pausedCount = counts.paused || 0;
+      const seedingCount = counts.seeding || 0;
+      const finishedCount = counts.finished || 0;
+      const errorCount = counts.error || 0;
+
+      const lines = [
+        "Download Station 상태",
+        "- 연결 상태: 정상",
+        `- 총 작업: ${snapshot.total}건`,
+        `- 진행중: ${activeCount}건 (다운로드 ${downloadingCount} / 대기 ${waitingCount} / 시딩 ${seedingCount})`,
+        `- 일시정지: ${pausedCount}건`,
+        `- 완료: ${finishedCount}건`,
+        `- 오류: ${errorCount}건`,
+        `- 현재 속도: ↓ ${formatSpeed(totalDownloadSpeed)} | ↑ ${formatSpeed(totalUploadSpeed)}`,
+      ];
+
+      if (snapshot.total > tasks.length) {
+        lines.push(`- 참고: 최근 ${tasks.length}건 기준으로 속도/상태를 집계했습니다.`);
+      }
+
+      await ctx.reply(lines.join("\n"));
+    } catch (error) {
+      await ctx.reply(`상태 조회 실패: ${error.message}`);
+    }
+  });
+
+  bot.command("task", async (ctx) => {
+    if (!(await ensureAuthorized(ctx))) return;
+
+    try {
+      const snapshot = await synology.getTaskSnapshot(200);
+      const tasks = (snapshot.tasks || []).slice().sort((a, b) => taskSortTime(b) - taskSortTime(a));
+      const activeTasks = tasks.filter((task) => ACTIVE_STATUSES.has(task.status));
+      const target = activeTasks.length > 0 ? activeTasks : tasks;
+      const selected = target.slice(0, 10);
+
+      if (selected.length === 0) {
+        await ctx.reply("등록된 다운로드 작업이 없습니다.");
+        return;
+      }
+
+      const lines = [
+        activeTasks.length > 0
+          ? `진행중 작업 ${selected.length}건`
+          : `진행중 작업이 없어 최근 작업 ${selected.length}건을 보여줍니다.`,
+      ];
+
+      selected.forEach((task, index) => {
+        const status = taskStatusLabel(task.status);
+        const title = shortenText(task.title);
+        const size = taskSize(task);
+        const downloaded = taskDownloaded(task);
+        const speed = taskDownloadSpeed(task);
+
+        let progressText = "-";
+        if (size > 0) {
+          progressText = `${formatBytes(downloaded)} / ${formatBytes(size)} (${formatPercent(downloaded / size)})`;
+        } else if (task.status === "finished") {
+          progressText = "완료";
+        } else if (downloaded > 0) {
+          progressText = `${formatBytes(downloaded)} 다운로드됨`;
+        }
+
+        const speedText = speed > 0 ? ` | ↓ ${formatSpeed(speed)}` : "";
+        lines.push(`${index + 1}. ${status} | ${progressText}${speedText} | ${title}`);
+      });
+
+      if (snapshot.total > tasks.length) {
+        lines.push(`참고: 전체 ${snapshot.total}건 중 최근 ${tasks.length}건만 조회했습니다.`);
+      }
+
+      await ctx.reply(lines.join("\n"));
+    } catch (error) {
+      await ctx.reply(`작업 조회 실패: ${error.message}`);
+    }
+  });
+
   bot.on("message", async (ctx) => {
-    if (!isAuthorized(ctx.chat.id)) {
-      await rejectUnauthorized(ctx);
+    if (!(await ensureAuthorized(ctx))) return;
+
+    const message = ctx.message || {};
+    if (typeof message.text === "string" && message.text.trim().startsWith("/")) {
       return;
     }
 
-    const message = ctx.message || {};
     const text = [message.text, message.caption].filter(Boolean).join("\n");
     const magnets = extractMagnets(text);
 
