@@ -1,0 +1,7 @@
+services:
+  synology-auto-bot:
+    build: .
+    container_name: synology-auto-bot
+    restart: unless-stopped
+    env_file:
+      - .env
