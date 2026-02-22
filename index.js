@@ -211,29 +211,36 @@ class SynologyDownloadStation {
   async createTaskFromUri(uri) {
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
-      const payload = {
-        api: "SYNO.DownloadStation.Task",
-        version: String(task.maxVersion),
-        method: "create",
-        uri,
-        _sid: this.sid,
+      const postUriTask = async (destination) => {
+        const payload = {
+          api: "SYNO.DownloadStation.Task",
+          version: String(task.maxVersion),
+          method: "create",
+          uri,
+          _sid: this.sid,
+        };
+        if (destination) {
+          payload.destination = destination;
+        }
+
+        const response = await this.http.post(
+          `/webapi/${task.path}`,
+          new URLSearchParams(payload).toString(),
+          {
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+          },
+        );
+        this.assertHttpOk(response, "마그넷 등록 실패");
+        return response;
       };
 
-      if (this.destination) {
-        payload.destination = this.destination;
+      let response = await postUriTask(this.destination);
+      if (!response.data?.success && this.destination && response.data?.error?.code === 101) {
+        response = await postUriTask("");
       }
 
-      const response = await this.http.post(
-        `/webapi/${task.path}`,
-        new URLSearchParams(payload).toString(),
-        {
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-        },
-      );
-
-      this.assertHttpOk(response, "마그넷 등록 실패");
       this.assertSynologySuccess(response.data, "마그넷 등록 실패");
     });
   }
@@ -242,60 +249,78 @@ class SynologyDownloadStation {
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
 
-      // DSM compatibility: send control parameters in query and upload only file as POST body.
-      const queryParams = new URLSearchParams({
-        api: "SYNO.DownloadStation.Task",
-        version: String(task.maxVersion),
-        method: "create",
-        _sid: this.sid,
-      });
-      if (this.destination) {
-        queryParams.set("destination", this.destination);
-      }
-
-      const form = new FormData();
-      form.append("file", fileBuffer, {
-        filename,
-        contentType: "application/x-bittorrent",
-      });
-
-      let response = await this.http.post(
-        `/webapi/${task.path}?${queryParams.toString()}`,
-        form,
-        {
-          headers: form.getHeaders(),
-          maxBodyLength: 20 * 1024 * 1024,
-          maxContentLength: 20 * 1024 * 1024,
-        },
-      );
-
-      this.assertHttpOk(response, "토렌트 파일 등록 실패");
-      if (response.data?.success) return;
-
-      // Fallback: some DSM versions accept all parameters in multipart body.
-      if (response.data?.error?.code === 101) {
-        const fallbackForm = new FormData();
-        fallbackForm.append("api", "SYNO.DownloadStation.Task");
-        fallbackForm.append("version", String(task.maxVersion));
-        fallbackForm.append("method", "create");
-        fallbackForm.append("_sid", this.sid);
-        if (this.destination) {
-          fallbackForm.append("destination", this.destination);
+      const postTorrentWithQuery = async (destination) => {
+        // DSM compatibility: send control parameters in query and upload only file as POST body.
+        const queryParams = new URLSearchParams({
+          api: "SYNO.DownloadStation.Task",
+          version: String(task.maxVersion),
+          method: "create",
+          _sid: this.sid,
+        });
+        if (destination) {
+          queryParams.set("destination", destination);
         }
-        fallbackForm.append("file", fileBuffer, {
+
+        const form = new FormData();
+        form.append("file", fileBuffer, {
           filename,
           contentType: "application/x-bittorrent",
         });
 
-        response = await this.http.post(`/webapi/${task.path}`, fallbackForm, {
-          headers: fallbackForm.getHeaders(),
+        const response = await this.http.post(
+          `/webapi/${task.path}?${queryParams.toString()}`,
+          form,
+          {
+            headers: form.getHeaders(),
+            maxBodyLength: 20 * 1024 * 1024,
+            maxContentLength: 20 * 1024 * 1024,
+          },
+        );
+        this.assertHttpOk(response, "토렌트 파일 등록 실패");
+        return response;
+      };
+
+      const postTorrentWithMultipart = async (destination) => {
+        const form = new FormData();
+        form.append("api", "SYNO.DownloadStation.Task");
+        form.append("version", String(task.maxVersion));
+        form.append("method", "create");
+        form.append("_sid", this.sid);
+        if (destination) {
+          form.append("destination", destination);
+        }
+        form.append("file", fileBuffer, {
+          filename,
+          contentType: "application/x-bittorrent",
+        });
+
+        const response = await this.http.post(`/webapi/${task.path}`, form, {
+          headers: form.getHeaders(),
           maxBodyLength: 20 * 1024 * 1024,
           maxContentLength: 20 * 1024 * 1024,
         });
-
         this.assertHttpOk(response, "토렌트 파일 등록 실패");
-        this.assertSynologySuccess(response.data, "토렌트 파일 등록 실패");
-        return;
+        return response;
+      };
+
+      const isParamError = (response) => response?.data?.error?.code === 101;
+
+      let response = await postTorrentWithQuery(this.destination);
+      if (response.data?.success) return;
+
+      if (this.destination && isParamError(response)) {
+        response = await postTorrentWithQuery("");
+        if (response.data?.success) return;
+      }
+
+      if (isParamError(response)) {
+        response = await postTorrentWithMultipart(this.destination);
+        if (response.data?.success) return;
+
+        if (this.destination && isParamError(response)) {
+          response = await postTorrentWithMultipart("");
+          if (response.data?.success) return;
+        }
       }
 
       this.assertSynologySuccess(response.data, "토렌트 파일 등록 실패");
