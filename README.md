@@ -30,21 +30,22 @@ cp .env.example .env
 - `TELEGRAM_ALLOWED_CHAT_IDS`: 허용할 채팅 ID 목록(쉼표 구분)
 - `SYNOLOGY_BASE_URL`: 예) `https://nas.example.com:5001`
 - `SYNOLOGY_USERNAME` / `SYNOLOGY_PASSWORD`: Download Station 권한 계정
-- `SYNOLOGY_DOWNLOAD_DIR`: (선택) 저장 경로
+- `SYNOLOGY_DOWNLOAD_DIR`: (선택) 저장 경로, 앞에 `/` 없이 입력
 - `SYNOLOGY_ALLOW_SELF_SIGNED`: NAS 인증서가 사설 인증서면 `true`
+- `BOT_DEBUG`: 디버그 로그 출력 (`true` / `false`)
 
 `TELEGRAM_ALLOWED_CHAT_IDS`는 봇 실행 후 텔레그램에서 `/id` 명령으로 확인 가능합니다.
 
 ## 3) 실행
 
 ```bash
-docker compose up -d --build
+docker-compose up -d --build
 ```
 
 로그 확인:
 
 ```bash
-docker compose logs -f
+docker-compose logs --tail=200 -f
 ```
 
 ## 4) 사용 방법 (아이폰)
@@ -71,7 +72,7 @@ docker compose logs -f
 
 - `Synology 로그인 실패`: URL/계정/비밀번호 및 Download Station 권한 확인
 - `허용되지 않은 채팅`: `/id`로 chat id 확인 후 `.env`에 추가
-- `토렌트 파일 등록 실패`: 파일 확장자 `.torrent` 및 Download Station 상태 확인
+- `토렌트 파일 등록 실패`: `BOT_DEBUG=true`로 로그 확인
 
 ## 주의
 

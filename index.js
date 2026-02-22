@@ -39,6 +39,22 @@ function extractMagnets(text) {
   return [...new Set(matches)];
 }
 
+function sanitizeTorrentFilename(name) {
+  const input = typeof name === "string" ? name : "";
+  const hasExt = input.toLowerCase().endsWith(".torrent");
+  const base = hasExt ? input.slice(0, -8) : input;
+
+  const ascii = base
+    .normalize("NFKD")
+    .replace(/[^\x20-\x7E]/g, "")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  const safeBase = ascii || `upload_${Date.now()}`;
+  return `${safeBase}.torrent`;
+}
+
 function toNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -139,6 +155,7 @@ class SynologyDownloadStation {
     this.allowSelfSigned = options.allowSelfSigned;
     this.sid = null;
     this.apiInfo = null;
+    this.debug = Boolean(options.debug);
 
     const isHttps = this.baseUrl.startsWith("https://");
     const httpsAgent =
@@ -152,6 +169,11 @@ class SynologyDownloadStation {
       httpsAgent,
       validateStatus: (status) => status >= 200 && status < 500,
     });
+  }
+
+  debugLog(...args) {
+    if (!this.debug) return;
+    console.log("[synology-auto-bot]", ...args);
   }
 
   async queryApiInfo() {
@@ -211,7 +233,7 @@ class SynologyDownloadStation {
   async createTaskFromUri(uri) {
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
-      const postUriTask = async (destination) => {
+      const postUriTask = async (destination, reason) => {
         const payload = {
           api: "SYNO.DownloadStation.Task",
           version: String(task.maxVersion),
@@ -223,6 +245,12 @@ class SynologyDownloadStation {
           payload.destination = destination;
         }
 
+        this.debugLog("createTaskFromUri attempt", {
+          reason,
+          destination: destination || "(default)",
+          uriPreview: String(uri).slice(0, 120),
+        });
+
         const response = await this.http.post(
           `/webapi/${task.path}`,
           new URLSearchParams(payload).toString(),
@@ -233,23 +261,36 @@ class SynologyDownloadStation {
           },
         );
         this.assertHttpOk(response, "마그넷 등록 실패");
+        this.debugLog("createTaskFromUri response", response.data);
         return response;
       };
 
-      let response = await postUriTask(this.destination);
+      let response = await postUriTask(this.destination, "primary");
       if (!response.data?.success && this.destination && response.data?.error?.code === 101) {
-        response = await postUriTask("");
+        response = await postUriTask("", "retry_without_destination");
       }
 
       this.assertSynologySuccess(response.data, "마그넷 등록 실패");
     });
   }
 
-  async createTaskFromTorrentFile(filename, fileBuffer) {
+  async createTaskFromTorrentFile(filename, fileBuffer, sourceUrl = "") {
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
+      const safeFilename = sanitizeTorrentFilename(filename);
 
-      const postTorrentWithQuery = async (destination) => {
+      if (!Buffer.isBuffer(fileBuffer) || fileBuffer.length === 0) {
+        throw new Error("다운로드한 파일 데이터가 비어 있습니다.");
+      }
+
+      this.debugLog("createTaskFromTorrentFile input", {
+        originalFilename: filename,
+        safeFilename,
+        fileSize: fileBuffer.length,
+        hasDestination: Boolean(this.destination),
+      });
+
+      const postTorrentWithQuery = async (destination, reason) => {
         // DSM compatibility: send control parameters in query and upload only file as POST body.
         const queryParams = new URLSearchParams({
           api: "SYNO.DownloadStation.Task",
@@ -263,8 +304,15 @@ class SynologyDownloadStation {
 
         const form = new FormData();
         form.append("file", fileBuffer, {
-          filename,
+          filename: safeFilename,
           contentType: "application/x-bittorrent",
+        });
+
+        this.debugLog("torrent upload attempt", {
+          reason,
+          mode: "query_file",
+          destination: destination || "(default)",
+          filename: safeFilename,
         });
 
         const response = await this.http.post(
@@ -277,10 +325,11 @@ class SynologyDownloadStation {
           },
         );
         this.assertHttpOk(response, "토렌트 파일 등록 실패");
+        this.debugLog("torrent upload response", response.data);
         return response;
       };
 
-      const postTorrentWithMultipart = async (destination) => {
+      const postTorrentWithMultipart = async (destination, reason) => {
         const form = new FormData();
         form.append("api", "SYNO.DownloadStation.Task");
         form.append("version", String(task.maxVersion));
@@ -290,8 +339,15 @@ class SynologyDownloadStation {
           form.append("destination", destination);
         }
         form.append("file", fileBuffer, {
-          filename,
+          filename: safeFilename,
           contentType: "application/x-bittorrent",
+        });
+
+        this.debugLog("torrent upload attempt", {
+          reason,
+          mode: "multipart",
+          destination: destination || "(default)",
+          filename: safeFilename,
         });
 
         const response = await this.http.post(`/webapi/${task.path}`, form, {
@@ -300,26 +356,39 @@ class SynologyDownloadStation {
           maxContentLength: 20 * 1024 * 1024,
         });
         this.assertHttpOk(response, "토렌트 파일 등록 실패");
+        this.debugLog("torrent upload response", response.data);
         return response;
       };
 
       const isParamError = (response) => response?.data?.error?.code === 101;
 
-      let response = await postTorrentWithQuery(this.destination);
+      let response = await postTorrentWithQuery(this.destination, "primary");
       if (response.data?.success) return;
 
       if (this.destination && isParamError(response)) {
-        response = await postTorrentWithQuery("");
+        response = await postTorrentWithQuery("", "retry_without_destination");
         if (response.data?.success) return;
       }
 
       if (isParamError(response)) {
-        response = await postTorrentWithMultipart(this.destination);
+        response = await postTorrentWithMultipart(this.destination, "fallback_multipart");
         if (response.data?.success) return;
 
         if (this.destination && isParamError(response)) {
-          response = await postTorrentWithMultipart("");
+          response = await postTorrentWithMultipart("", "fallback_multipart_without_destination");
           if (response.data?.success) return;
+        }
+      }
+
+      if (sourceUrl) {
+        this.debugLog("torrent upload failed, retry by URI", {
+          sourceUrlPreview: String(sourceUrl).slice(0, 160),
+        });
+        try {
+          await this.createTaskFromUri(sourceUrl);
+          return;
+        } catch (uriError) {
+          this.debugLog("URI fallback failed", { message: uriError.message });
         }
       }
 
@@ -418,6 +487,7 @@ async function main() {
     password: getEnv("SYNOLOGY_PASSWORD"),
     destination: process.env.SYNOLOGY_DOWNLOAD_DIR || "",
     allowSelfSigned: parseBoolean(process.env.SYNOLOGY_ALLOW_SELF_SIGNED, false),
+    debug: parseBoolean(process.env.BOT_DEBUG, false),
   });
 
   const bot = new Telegraf(botToken);
@@ -603,7 +673,7 @@ async function main() {
             maxBodyLength: 20 * 1024 * 1024,
             maxContentLength: 20 * 1024 * 1024,
           });
-          await synology.createTaskFromTorrentFile(fileName, Buffer.from(fileResponse.data));
+          await synology.createTaskFromTorrentFile(fileName, Buffer.from(fileResponse.data), fileLink.toString());
           added.push(`토렌트 파일 1건 (${fileName})`);
         } catch (error) {
           failed.push(`토렌트 파일 등록 실패: ${error.message}`);
