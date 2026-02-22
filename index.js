@@ -412,6 +412,40 @@ class SynologyDownloadStation {
     });
   }
 
+  async pauseTasks(taskIds) {
+    const ids = (Array.isArray(taskIds) ? taskIds : [taskIds])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean);
+
+    if (ids.length === 0) {
+      return;
+    }
+
+    return this.runWithRetry(async () => {
+      const { task } = await this.queryApiInfo();
+      const payload = {
+        api: "SYNO.DownloadStation.Task",
+        version: String(task.maxVersion),
+        method: "pause",
+        id: ids.join(","),
+        _sid: this.sid,
+      };
+
+      const response = await this.http.post(
+        `/webapi/${task.path}`,
+        new URLSearchParams(payload).toString(),
+        {
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+        },
+      );
+
+      this.assertHttpOk(response, "작업 일시정지 실패");
+      this.assertSynologySuccess(response.data, "작업 일시정지 실패");
+    });
+  }
+
   async listTasks(options = {}) {
     const offset = toNumber(options.offset, 0);
     const limit = Math.max(1, toNumber(options.limit, 50));
@@ -506,6 +540,12 @@ async function main() {
     debug: parseBoolean(process.env.BOT_DEBUG, false),
   });
 
+  const autoStopSeeding = parseBoolean(process.env.AUTO_STOP_SEEDING, true);
+  const autoStopSeedingIntervalSec = Math.max(
+    5,
+    toNumber(process.env.AUTO_STOP_SEEDING_INTERVAL_SEC, 30),
+  );
+
   const bot = new Telegraf(botToken);
 
   const usage = [
@@ -518,6 +558,8 @@ async function main() {
     "/stat - Download Station 상태 요약",
     "/task - 다운로드 진행 상황",
     "/help - 사용법 보기",
+    "",
+    `자동 시딩 중지: ${autoStopSeeding ? "ON" : "OFF"} (주기 ${autoStopSeedingIntervalSec}초)`,
   ].join("\n");
 
   function isAuthorized(chatId) {
@@ -537,6 +579,59 @@ async function main() {
       return false;
     }
     return true;
+  }
+
+  async function stopSeedingTasksNow(trigger = "manual") {
+    const snapshot = await synology.getTaskSnapshot(300);
+    const seedingTasks = (snapshot.tasks || []).filter((task) => task.status === "seeding");
+
+    if (seedingTasks.length === 0) {
+      return { checked: snapshot.total, paused: 0, seeding: 0 };
+    }
+
+    let paused = 0;
+    for (const task of seedingTasks) {
+      const taskId = String(task.id || "").trim();
+      if (!taskId) continue;
+
+      try {
+        await synology.pauseTasks(taskId);
+        paused += 1;
+        synology.debugLog("auto-stop seeding paused", {
+          trigger,
+          taskId,
+          title: task.title,
+        });
+      } catch (error) {
+        synology.debugLog("auto-stop seeding pause failed", {
+          trigger,
+          taskId,
+          message: error.message,
+        });
+      }
+    }
+
+    return { checked: snapshot.total, paused, seeding: seedingTasks.length };
+  }
+
+  let autoStopSeedingRunning = false;
+  async function runAutoStopSeeding(trigger = "interval") {
+    if (!autoStopSeeding) return;
+    if (autoStopSeedingRunning) return;
+
+    autoStopSeedingRunning = true;
+    try {
+      const result = await stopSeedingTasksNow(trigger);
+      if (result.paused > 0) {
+        console.log(
+          `[synology-auto-bot] auto-stop-seeding paused ${result.paused} task(s) out of ${result.seeding} seeding task(s).`,
+        );
+      }
+    } catch (error) {
+      console.error("[synology-auto-bot] auto-stop-seeding failed:", error.message);
+    } finally {
+      autoStopSeedingRunning = false;
+    }
   }
 
   bot.start(async (ctx) => {
@@ -750,6 +845,21 @@ async function main() {
 
   await synology.login();
   await bot.launch();
+
+  if (autoStopSeeding) {
+    await runAutoStopSeeding("startup");
+    const intervalMs = autoStopSeedingIntervalSec * 1000;
+    const timer = setInterval(() => {
+      runAutoStopSeeding("interval");
+    }, intervalMs);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    console.log(`[synology-auto-bot] auto-stop-seeding enabled (interval: ${autoStopSeedingIntervalSec}s)`);
+  } else {
+    console.log("[synology-auto-bot] auto-stop-seeding disabled");
+  }
+
   console.log("Synology Telegram torrent bridge is running.");
 
   process.once("SIGINT", () => bot.stop("SIGINT"));

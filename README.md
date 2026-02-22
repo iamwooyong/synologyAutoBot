@@ -5,6 +5,8 @@
 - 마그넷 링크 텍스트
 - `.torrent` 파일 첨부
 
+추가로, 다운로드 완료 후 `seeding` 상태가 되면 자동으로 일시정지해서 공유를 중지할 수 있습니다.
+
 ## 준비물
 
 - Synology NAS (Download Station 설치/활성화)
@@ -32,6 +34,8 @@ cp .env.example .env
 - `SYNOLOGY_USERNAME` / `SYNOLOGY_PASSWORD`: Download Station 권한 계정
 - `SYNOLOGY_DOWNLOAD_DIR`: (선택) 저장 경로, 앞에 `/` 없이 입력
 - `SYNOLOGY_ALLOW_SELF_SIGNED`: NAS 인증서가 사설 인증서면 `true`
+- `AUTO_STOP_SEEDING`: 다운로드 완료 후 시딩 자동 중지 (`true` / `false`)
+- `AUTO_STOP_SEEDING_INTERVAL_SEC`: 시딩 상태 점검 주기(초)
 - `BOT_DEBUG`: 디버그 로그 출력 (`true` / `false`)
 
 `TELEGRAM_ALLOWED_CHAT_IDS`는 봇 실행 후 텔레그램에서 `/id` 명령으로 확인 가능합니다.
