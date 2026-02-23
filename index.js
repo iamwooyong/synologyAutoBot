@@ -55,6 +55,25 @@ function sanitizeTorrentFilename(name) {
   return `${safeBase}.torrent`;
 }
 
+let parseTorrentModulePromise = null;
+
+async function getParseTorrent() {
+  if (!parseTorrentModulePromise) {
+    parseTorrentModulePromise = import("parse-torrent").then((mod) => mod.default || mod);
+  }
+  return parseTorrentModulePromise;
+}
+
+async function buildMagnetFromTorrentBuffer(fileBuffer) {
+  try {
+    const parseTorrent = await getParseTorrent();
+    const parsed = parseTorrent(fileBuffer);
+    return parsed?.magnetURI || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function toNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
@@ -274,7 +293,7 @@ class SynologyDownloadStation {
     });
   }
 
-  async createTaskFromTorrentFile(filename, fileBuffer, sourceUrl = "") {
+  async createTaskFromTorrentFile(filename, fileBuffer) {
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
       const safeFilename = sanitizeTorrentFilename(filename);
@@ -380,15 +399,16 @@ class SynologyDownloadStation {
         }
       }
 
-      if (sourceUrl) {
-        this.debugLog("torrent upload failed, retry by URI", {
-          sourceUrlPreview: String(sourceUrl).slice(0, 160),
+      const magnetFallback = await buildMagnetFromTorrentBuffer(fileBuffer);
+      if (magnetFallback) {
+        this.debugLog("torrent upload failed, retry by parsed magnet", {
+          magnetPreview: magnetFallback.slice(0, 160),
         });
         try {
-          await this.createTaskFromUri(sourceUrl);
+          await this.createTaskFromUri(magnetFallback);
           return;
-        } catch (uriError) {
-          this.debugLog("URI fallback failed", { message: uriError.message });
+        } catch (magnetError) {
+          this.debugLog("parsed magnet fallback failed", { message: magnetError.message });
         }
       }
 
@@ -770,7 +790,7 @@ async function main() {
           });
 
           const fileBuffer = Buffer.from(fileResponse.data);
-          await synology.createTaskFromTorrentFile(fileName, fileBuffer, fileLink.toString());
+          await synology.createTaskFromTorrentFile(fileName, fileBuffer);
           added.push(`토렌트 파일 1건 (${fileName})`);
         } catch (error) {
           failed.push(`토렌트 파일 가져오기 실패: ${error.message}`);
