@@ -1,7 +1,9 @@
 require("dotenv").config();
 
 const crypto = require("crypto");
+const fs = require("fs/promises");
 const https = require("https");
+const path = require("path");
 const axios = require("axios");
 const FormData = require("form-data");
 const { Telegraf } = require("telegraf");
@@ -483,6 +485,7 @@ class SynologyDownloadStation {
     this.username = options.username;
     this.password = options.password;
     this.destination = options.destination || "";
+    this.torrentWatchDir = options.torrentWatchDir || "";
     this.allowSelfSigned = options.allowSelfSigned;
     this.sid = null;
     this.apiInfo = null;
@@ -711,6 +714,26 @@ class SynologyDownloadStation {
         }
       }
 
+      if (this.torrentWatchDir) {
+        this.debugLog("torrent upload failed, retry by watch folder", {
+          watchDir: this.torrentWatchDir,
+          filename: safeFilename,
+        });
+        try {
+          const savedPath = await this.enqueueTorrentFileToWatchFolder(safeFilename, fileBuffer);
+          this.debugLog("watch folder enqueue success", {
+            watchDir: this.torrentWatchDir,
+            savedPath,
+          });
+          return;
+        } catch (watchError) {
+          this.debugLog("watch folder enqueue failed", {
+            watchDir: this.torrentWatchDir,
+            message: watchError.message,
+          });
+        }
+      }
+
       const magnetFallback = await buildMagnetFromTorrentBuffer(fileBuffer, (...args) => this.debugLog(...args));
       if (magnetFallback) {
         this.debugLog("torrent upload failed, retry by parsed magnet", {
@@ -726,6 +749,28 @@ class SynologyDownloadStation {
 
       this.assertSynologySuccess(response.data, "토렌트 파일 등록 실패");
     });
+  }
+
+  async enqueueTorrentFileToWatchFolder(filename, fileBuffer) {
+    const watchDir = String(this.torrentWatchDir || "").trim();
+    if (!watchDir) {
+      throw new Error("워치 폴더 경로가 비어 있습니다.");
+    }
+    if (!Buffer.isBuffer(fileBuffer) || fileBuffer.length === 0) {
+      throw new Error("워치 폴더에 저장할 토렌트 데이터가 비어 있습니다.");
+    }
+
+    const safeFilename = sanitizeTorrentFilename(filename);
+    const uniquePrefix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const targetFilename = `${uniquePrefix}_${safeFilename}`;
+    const targetPath = path.join(watchDir, targetFilename);
+    const tempPath = `${targetPath}.part`;
+
+    await fs.mkdir(watchDir, { recursive: true });
+    await fs.writeFile(tempPath, fileBuffer);
+    await fs.rename(tempPath, targetPath);
+
+    return targetPath;
   }
 
   async pauseTasks(taskIds) {
@@ -847,11 +892,17 @@ class SynologyDownloadStation {
 async function main() {
   const botToken = getEnv("TELEGRAM_BOT_TOKEN");
   const allowedChatIds = parseAllowedChatIds(process.env.TELEGRAM_ALLOWED_CHAT_IDS);
+  const torrentWatchDir =
+    process.env.SYNOLOGY_TORRENT_WATCH_DIR === undefined
+      ? "/watch"
+      : String(process.env.SYNOLOGY_TORRENT_WATCH_DIR || "").trim();
+
   const synology = new SynologyDownloadStation({
     baseUrl: getEnv("SYNOLOGY_BASE_URL"),
     username: getEnv("SYNOLOGY_USERNAME"),
     password: getEnv("SYNOLOGY_PASSWORD"),
     destination: process.env.SYNOLOGY_DOWNLOAD_DIR || "",
+    torrentWatchDir,
     allowSelfSigned: parseBoolean(process.env.SYNOLOGY_ALLOW_SELF_SIGNED, false),
     debug: parseBoolean(process.env.BOT_DEBUG, false),
   });
@@ -875,6 +926,7 @@ async function main() {
     "/task - 다운로드 진행 상황",
     "/help - 사용법 보기",
     "",
+    `워치 폴더 fallback: ${torrentWatchDir ? `ON (${torrentWatchDir})` : "OFF"}`,
     `자동 시딩 중지: ${autoStopSeeding ? "ON" : "OFF"} (주기 ${autoStopSeedingIntervalSec}초)`,
   ].join("\n");
 
@@ -1144,6 +1196,12 @@ async function main() {
     console.log(`[synology-auto-bot] auto-stop-seeding enabled (interval: ${autoStopSeedingIntervalSec}s)`);
   } else {
     console.log("[synology-auto-bot] auto-stop-seeding disabled");
+  }
+
+  if (torrentWatchDir) {
+    console.log(`[synology-auto-bot] torrent watch-folder fallback enabled: ${torrentWatchDir}`);
+  } else {
+    console.log("[synology-auto-bot] torrent watch-folder fallback disabled");
   }
 
   console.log("Synology Telegram torrent bridge is running.");

@@ -33,12 +33,20 @@ cp .env.example .env
 - `SYNOLOGY_BASE_URL`: 예) `https://nas.example.com:5001`
 - `SYNOLOGY_USERNAME` / `SYNOLOGY_PASSWORD`: Download Station 권한 계정
 - `SYNOLOGY_DOWNLOAD_DIR`: (선택) 저장 경로, 앞에 `/` 없이 입력
+- `SYNOLOGY_TORRENT_WATCH_DIR_HOST`: NAS 워치 폴더 경로 (예: `usbshare2/torrentDown/torrent_watch`)
+- `SYNOLOGY_TORRENT_WATCH_DIR`: 컨테이너 내부 워치 폴더 경로 (기본 `/watch`)
 - `SYNOLOGY_ALLOW_SELF_SIGNED`: NAS 인증서가 사설 인증서면 `true`
 - `AUTO_STOP_SEEDING`: 다운로드 완료 후 시딩 자동 중지 (`true` / `false`)
 - `AUTO_STOP_SEEDING_INTERVAL_SEC`: 시딩 상태 점검 주기(초)
 - `BOT_DEBUG`: 디버그 로그 출력 (`true` / `false`)
 
 `TELEGRAM_ALLOWED_CHAT_IDS`는 봇 실행 후 텔레그램에서 `/id` 명령으로 확인 가능합니다.
+
+`.torrent` 등록 순서:
+
+1. Download Station API 파일 업로드
+2. 실패 시 워치 폴더에 `.torrent` 파일 직접 저장
+3. 그래도 실패 시 마그넷 fallback
 
 ## 3) 실행
 

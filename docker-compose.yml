@@ -5,3 +5,5 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - ${SYNOLOGY_TORRENT_WATCH_DIR_HOST:-/usbshare2/torrentDown/torrent_watch}:${SYNOLOGY_TORRENT_WATCH_DIR:-/watch}
