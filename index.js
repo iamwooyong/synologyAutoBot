@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const https = require("https");
 const axios = require("axios");
 const FormData = require("form-data");
@@ -64,14 +65,171 @@ async function getParseTorrent() {
   return parseTorrentModulePromise;
 }
 
-async function buildMagnetFromTorrentBuffer(fileBuffer) {
+function parseBencodeStringBounds(fileBuffer, start) {
+  let cursor = start;
+  let length = 0;
+
+  while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x3a) {
+    const byte = fileBuffer[cursor];
+    if (byte < 0x30 || byte > 0x39) {
+      throw new Error(`유효하지 않은 bencode 문자열 길이 (index: ${cursor})`);
+    }
+    length = length * 10 + (byte - 0x30);
+    cursor += 1;
+  }
+
+  if (cursor >= fileBuffer.length) {
+    throw new Error("bencode 문자열 구분자(:)를 찾지 못했습니다.");
+  }
+
+  cursor += 1;
+  const end = cursor + length;
+  if (end > fileBuffer.length) {
+    throw new Error("bencode 문자열 길이가 버퍼 범위를 초과합니다.");
+  }
+
+  return {
+    valueStart: cursor,
+    valueEnd: end,
+    next: end,
+  };
+}
+
+function skipBencodeValue(fileBuffer, start) {
+  if (start >= fileBuffer.length) {
+    throw new Error("bencode value 시작 위치가 잘못되었습니다.");
+  }
+
+  const token = fileBuffer[start];
+
+  if (token === 0x69) {
+    let cursor = start + 1;
+    if (cursor >= fileBuffer.length) {
+      throw new Error("정수 bencode가 비어 있습니다.");
+    }
+
+    if (fileBuffer[cursor] === 0x2d) {
+      cursor += 1;
+    }
+
+    let hasDigit = false;
+    while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+      const byte = fileBuffer[cursor];
+      if (byte < 0x30 || byte > 0x39) {
+        throw new Error(`유효하지 않은 정수 bencode (index: ${cursor})`);
+      }
+      hasDigit = true;
+      cursor += 1;
+    }
+
+    if (!hasDigit || cursor >= fileBuffer.length) {
+      throw new Error("정수 bencode 종료(e)를 찾지 못했습니다.");
+    }
+
+    return cursor + 1;
+  }
+
+  if (token === 0x6c) {
+    let cursor = start + 1;
+    while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+      cursor = skipBencodeValue(fileBuffer, cursor);
+    }
+    if (cursor >= fileBuffer.length) {
+      throw new Error("리스트 bencode 종료(e)를 찾지 못했습니다.");
+    }
+    return cursor + 1;
+  }
+
+  if (token === 0x64) {
+    let cursor = start + 1;
+    while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+      const keyBounds = parseBencodeStringBounds(fileBuffer, cursor);
+      cursor = keyBounds.next;
+      cursor = skipBencodeValue(fileBuffer, cursor);
+    }
+    if (cursor >= fileBuffer.length) {
+      throw new Error("딕셔너리 bencode 종료(e)를 찾지 못했습니다.");
+    }
+    return cursor + 1;
+  }
+
+  if (token >= 0x30 && token <= 0x39) {
+    return parseBencodeStringBounds(fileBuffer, start).next;
+  }
+
+  throw new Error(`알 수 없는 bencode 토큰: ${String.fromCharCode(token)} (index: ${start})`);
+}
+
+function findTorrentInfoSection(fileBuffer) {
+  if (!Buffer.isBuffer(fileBuffer) || fileBuffer.length === 0) {
+    return null;
+  }
+
+  let cursor = 0;
+  if (fileBuffer[cursor] !== 0x64) {
+    throw new Error("torrent 루트가 딕셔너리 형식이 아닙니다.");
+  }
+  cursor += 1;
+
+  while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+    const keyBounds = parseBencodeStringBounds(fileBuffer, cursor);
+    const key = fileBuffer.slice(keyBounds.valueStart, keyBounds.valueEnd).toString("utf8");
+    cursor = keyBounds.next;
+
+    const valueStart = cursor;
+    const valueEnd = skipBencodeValue(fileBuffer, valueStart);
+    if (key === "info") {
+      return fileBuffer.slice(valueStart, valueEnd);
+    }
+
+    cursor = valueEnd;
+  }
+
+  return null;
+}
+
+function buildMagnetFromInfoSection(infoSection) {
+  if (!Buffer.isBuffer(infoSection) || infoSection.length === 0) {
+    return null;
+  }
+  const infoHashHex = crypto.createHash("sha1").update(infoSection).digest("hex");
+  return `magnet:?xt=urn:btih:${infoHashHex}`;
+}
+
+async function buildMagnetFromTorrentBuffer(fileBuffer, debugLog) {
+  const errors = [];
+
   try {
     const parseTorrent = await getParseTorrent();
     const parsed = parseTorrent(fileBuffer);
-    return parsed?.magnetURI || null;
-  } catch (_error) {
-    return null;
+    if (parsed?.magnetURI) {
+      return parsed.magnetURI;
+    }
+    errors.push("parse-torrent 결과에 magnetURI가 없습니다.");
+  } catch (error) {
+    errors.push(`parse-torrent 실패: ${error.message}`);
   }
+
+  try {
+    const infoSection = findTorrentInfoSection(fileBuffer);
+    if (!infoSection) {
+      errors.push("torrent info 섹션을 찾지 못했습니다.");
+    } else {
+      const magnet = buildMagnetFromInfoSection(infoSection);
+      if (magnet) {
+        return magnet;
+      }
+      errors.push("info hash로 magnet URI를 생성하지 못했습니다.");
+    }
+  } catch (error) {
+    errors.push(`내장 bencode 파서 실패: ${error.message}`);
+  }
+
+  if (typeof debugLog === "function" && errors.length > 0) {
+    debugLog("torrent->magnet 변환 실패", { errors });
+  }
+
+  return null;
 }
 
 function toNumber(value, fallback = 0) {
@@ -399,7 +557,7 @@ class SynologyDownloadStation {
         }
       }
 
-      const magnetFallback = await buildMagnetFromTorrentBuffer(fileBuffer);
+      const magnetFallback = await buildMagnetFromTorrentBuffer(fileBuffer, (...args) => this.debugLog(...args));
       if (magnetFallback) {
         this.debugLog("torrent upload failed, retry by parsed magnet", {
           magnetPreview: magnetFallback.slice(0, 160),
