@@ -326,24 +326,22 @@ function buildMagnetFromInfoSection(infoSection, metadata = {}) {
   }
 
   const infoHashHex = crypto.createHash("sha1").update(infoSection).digest("hex");
-  const params = new URLSearchParams({
-    xt: `urn:btih:${infoHashHex}`,
-  });
+  const parts = [`xt=urn:btih:${infoHashHex}`];
 
   const displayName = typeof metadata.displayName === "string" ? metadata.displayName.trim() : "";
   if (displayName) {
-    params.set("dn", displayName);
+    parts.push(`dn=${encodeURIComponent(displayName)}`);
   }
 
   const trackers = Array.isArray(metadata.trackers) ? metadata.trackers : [];
   for (const tracker of trackers) {
     const cleanTracker = typeof tracker === "string" ? tracker.trim() : "";
     if (cleanTracker) {
-      params.append("tr", cleanTracker);
+      parts.push(`tr=${encodeURIComponent(cleanTracker)}`);
     }
   }
 
-  return `magnet:?${params.toString()}`;
+  return `magnet:?${parts.join("&")}`;
 }
 
 async function buildMagnetFromTorrentBuffer(fileBuffer, debugLog) {
