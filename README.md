@@ -38,6 +38,8 @@ cp .env.example .env
 - `SYNOLOGY_ALLOW_SELF_SIGNED`: NAS 인증서가 사설 인증서면 `true`
 - `AUTO_STOP_SEEDING`: 다운로드 완료 후 시딩 자동 중지 (`true` / `false`)
 - `AUTO_STOP_SEEDING_INTERVAL_SEC`: 시딩 상태 점검 주기(초)
+- `AUTO_REMOVE_FINISHED`: 완료 항목 자동 삭제 (`true` / `false`)
+- `AUTO_REMOVE_FINISHED_INTERVAL_SEC`: 완료 항목 정리 주기(초)
 - `BOT_DEBUG`: 디버그 로그 출력 (`true` / `false`)
 
 `TELEGRAM_ALLOWED_CHAT_IDS`는 봇 실행 후 텔레그램에서 `/id` 명령으로 확인 가능합니다.
@@ -72,6 +74,7 @@ docker-compose logs --tail=200 -f
 - `/id`: 현재 채팅 ID 확인
 - `/stat`: Download Station 상태 요약
 - `/task`: 다운로드 진행 상황(진행중 작업 우선)
+- `/clean`: 완료 항목 즉시 정리
 - `/help`: 사용법 보기
 
 ## 보안 권장

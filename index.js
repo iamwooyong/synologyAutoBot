@@ -807,6 +807,40 @@ class SynologyDownloadStation {
     });
   }
 
+  async deleteTasks(taskIds) {
+    const ids = (Array.isArray(taskIds) ? taskIds : [taskIds])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean);
+
+    if (ids.length === 0) {
+      return;
+    }
+
+    return this.runWithRetry(async () => {
+      const { task } = await this.queryApiInfo();
+      const payload = {
+        api: "SYNO.DownloadStation.Task",
+        version: String(task.maxVersion),
+        method: "delete",
+        id: ids.join(","),
+        _sid: this.sid,
+      };
+
+      const response = await this.http.post(
+        `/webapi/${task.path}`,
+        new URLSearchParams(payload).toString(),
+        {
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+        },
+      );
+
+      this.assertHttpOk(response, "작업 삭제 실패");
+      this.assertSynologySuccess(response.data, "작업 삭제 실패");
+    });
+  }
+
   async listTasks(options = {}) {
     const offset = toNumber(options.offset, 0);
     const limit = Math.max(1, toNumber(options.limit, 50));
@@ -912,6 +946,11 @@ async function main() {
     5,
     toNumber(process.env.AUTO_STOP_SEEDING_INTERVAL_SEC, 30),
   );
+  const autoRemoveFinished = parseBoolean(process.env.AUTO_REMOVE_FINISHED, true);
+  const autoRemoveFinishedIntervalSec = Math.max(
+    5,
+    toNumber(process.env.AUTO_REMOVE_FINISHED_INTERVAL_SEC, 60),
+  );
 
   const bot = new Telegraf(botToken);
 
@@ -924,10 +963,12 @@ async function main() {
     "/id - 현재 채팅 ID 확인",
     "/stat - Download Station 상태 요약",
     "/task - 다운로드 진행 상황",
+    "/clean - 완료 항목 정리",
     "/help - 사용법 보기",
     "",
     `워치 폴더 fallback: ${torrentWatchDir ? `ON (${torrentWatchDir})` : "OFF"}`,
     `자동 시딩 중지: ${autoStopSeeding ? "ON" : "OFF"} (주기 ${autoStopSeedingIntervalSec}초)`,
+    `완료 항목 자동 정리: ${autoRemoveFinished ? "ON" : "OFF"} (주기 ${autoRemoveFinishedIntervalSec}초)`,
   ].join("\n");
 
   function isAuthorized(chatId) {
@@ -999,6 +1040,59 @@ async function main() {
       console.error("[synology-auto-bot] auto-stop-seeding failed:", error.message);
     } finally {
       autoStopSeedingRunning = false;
+    }
+  }
+
+  async function removeFinishedTasksNow(trigger = "manual") {
+    const snapshot = await synology.getTaskSnapshot(300);
+    const finishedTasks = (snapshot.tasks || []).filter((task) => task.status === "finished");
+
+    if (finishedTasks.length === 0) {
+      return { checked: snapshot.total, removed: 0, finished: 0 };
+    }
+
+    let removed = 0;
+    for (const task of finishedTasks) {
+      const taskId = String(task.id || "").trim();
+      if (!taskId) continue;
+
+      try {
+        await synology.deleteTasks(taskId);
+        removed += 1;
+        synology.debugLog("auto-clean finished task removed", {
+          trigger,
+          taskId,
+          title: task.title,
+        });
+      } catch (error) {
+        synology.debugLog("auto-clean finished task remove failed", {
+          trigger,
+          taskId,
+          message: error.message,
+        });
+      }
+    }
+
+    return { checked: snapshot.total, removed, finished: finishedTasks.length };
+  }
+
+  let autoRemoveFinishedRunning = false;
+  async function runAutoRemoveFinished(trigger = "interval") {
+    if (!autoRemoveFinished) return;
+    if (autoRemoveFinishedRunning) return;
+
+    autoRemoveFinishedRunning = true;
+    try {
+      const result = await removeFinishedTasksNow(trigger);
+      if (result.removed > 0) {
+        console.log(
+          `[synology-auto-bot] auto-remove-finished removed ${result.removed} task(s) out of ${result.finished} finished task(s).`,
+        );
+      }
+    } catch (error) {
+      console.error("[synology-auto-bot] auto-remove-finished failed:", error.message);
+    } finally {
+      autoRemoveFinishedRunning = false;
     }
   }
 
@@ -1113,6 +1207,21 @@ async function main() {
     }
   });
 
+  bot.command("clean", async (ctx) => {
+    if (!(await ensureAuthorized(ctx))) return;
+
+    try {
+      const result = await removeFinishedTasksNow("command");
+      if (result.finished === 0) {
+        await ctx.reply("정리할 완료 항목이 없습니다.");
+        return;
+      }
+      await ctx.reply(`완료 항목 정리: ${result.removed}/${result.finished}건 삭제`);
+    } catch (error) {
+      await ctx.reply(`완료 항목 정리 실패: ${error.message}`);
+    }
+  });
+
   bot.on("message", async (ctx) => {
     if (!(await ensureAuthorized(ctx))) return;
 
@@ -1196,6 +1305,22 @@ async function main() {
     console.log(`[synology-auto-bot] auto-stop-seeding enabled (interval: ${autoStopSeedingIntervalSec}s)`);
   } else {
     console.log("[synology-auto-bot] auto-stop-seeding disabled");
+  }
+
+  if (autoRemoveFinished) {
+    await runAutoRemoveFinished("startup");
+    const intervalMs = autoRemoveFinishedIntervalSec * 1000;
+    const timer = setInterval(() => {
+      runAutoRemoveFinished("interval");
+    }, intervalMs);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    console.log(
+      `[synology-auto-bot] auto-remove-finished enabled (interval: ${autoRemoveFinishedIntervalSec}s)`,
+    );
+  } else {
+    console.log("[synology-auto-bot] auto-remove-finished disabled");
   }
 
   if (torrentWatchDir) {
