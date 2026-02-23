@@ -3,7 +3,6 @@ require("dotenv").config();
 const https = require("https");
 const axios = require("axios");
 const FormData = require("form-data");
-const parseTorrent = require("parse-torrent");
 const { Telegraf } = require("telegraf");
 
 function getEnv(name, fallback = "") {
@@ -54,21 +53,6 @@ function sanitizeTorrentFilename(name) {
 
   const safeBase = ascii || `upload_${Date.now()}`;
   return `${safeBase}.torrent`;
-}
-
-function extractMagnetFromTorrentBuffer(fileBuffer) {
-  try {
-    const parsed = parseTorrent(fileBuffer);
-    return parsed?.magnetURI || null;
-  } catch (_error) {
-    return null;
-  }
-}
-
-function extractErrorCodeFromMessage(message) {
-  if (!message) return null;
-  const matched = String(message).match(/code:\s*(\d+)/i);
-  return matched ? Number(matched[1]) : null;
 }
 
 function toNumber(value, fallback = 0) {
@@ -786,38 +770,8 @@ async function main() {
           });
 
           const fileBuffer = Buffer.from(fileResponse.data);
-          const magnetFallback = extractMagnetFromTorrentBuffer(fileBuffer);
-
-          try {
-            await synology.createTaskFromTorrentFile(fileName, fileBuffer, fileLink.toString());
-            added.push(`토렌트 파일 1건 (${fileName})`);
-          } catch (uploadError) {
-            synology.debugLog("direct torrent upload failed", {
-              message: uploadError?.message,
-              hasMagnetFallback: Boolean(magnetFallback),
-            });
-
-            if (magnetFallback) {
-              try {
-                await synology.createTaskFromUri(magnetFallback);
-                added.push(`토렌트 파일 1건 (${fileName}, 마그넷 fallback)`);
-              } catch (magnetError) {
-                const uploadCode = extractErrorCodeFromMessage(uploadError?.message);
-                const magnetCode = extractErrorCodeFromMessage(magnetError?.message);
-                const hint =
-                  uploadCode === 101 || magnetCode === 406
-                    ? " (Download Station 기본 저장 경로/권한 확인 필요)"
-                    : "";
-                failed.push(
-                  `토렌트 파일 등록 실패: ${uploadError.message} | 마그넷 fallback 실패: ${magnetError.message}${hint}`,
-                );
-              }
-            } else {
-              const uploadCode = extractErrorCodeFromMessage(uploadError?.message);
-              const hint = uploadCode === 101 ? " (Download Station 설정 점검 필요)" : "";
-              failed.push(`토렌트 파일 등록 실패: ${uploadError.message}${hint}`);
-            }
-          }
+          await synology.createTaskFromTorrentFile(fileName, fileBuffer, fileLink.toString());
+          added.push(`토렌트 파일 1건 (${fileName})`);
         } catch (error) {
           failed.push(`토렌트 파일 가져오기 실패: ${error.message}`);
         }
