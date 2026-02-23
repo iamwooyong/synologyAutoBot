@@ -188,12 +188,162 @@ function findTorrentInfoSection(fileBuffer) {
   return null;
 }
 
-function buildMagnetFromInfoSection(infoSection) {
+function decodeBencodeValue(fileBuffer, start) {
+  if (start >= fileBuffer.length) {
+    throw new Error("bencode value 시작 위치가 잘못되었습니다.");
+  }
+
+  const token = fileBuffer[start];
+
+  if (token === 0x69) {
+    const end = fileBuffer.indexOf(0x65, start + 1);
+    if (end === -1) {
+      throw new Error("정수 bencode 종료(e)를 찾지 못했습니다.");
+    }
+
+    const raw = fileBuffer.slice(start + 1, end).toString("ascii");
+    if (!/^[-]?\d+$/.test(raw)) {
+      throw new Error(`유효하지 않은 정수 bencode 값: ${raw}`);
+    }
+
+    return {
+      value: Number(raw),
+      next: end + 1,
+    };
+  }
+
+  if (token === 0x6c) {
+    const list = [];
+    let cursor = start + 1;
+    while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+      const item = decodeBencodeValue(fileBuffer, cursor);
+      list.push(item.value);
+      cursor = item.next;
+    }
+    if (cursor >= fileBuffer.length) {
+      throw new Error("리스트 bencode 종료(e)를 찾지 못했습니다.");
+    }
+    return {
+      value: list,
+      next: cursor + 1,
+    };
+  }
+
+  if (token === 0x64) {
+    const dict = {};
+    let cursor = start + 1;
+    while (cursor < fileBuffer.length && fileBuffer[cursor] !== 0x65) {
+      const keyBounds = parseBencodeStringBounds(fileBuffer, cursor);
+      const key = fileBuffer.slice(keyBounds.valueStart, keyBounds.valueEnd).toString("utf8");
+      cursor = keyBounds.next;
+      const item = decodeBencodeValue(fileBuffer, cursor);
+      dict[key] = item.value;
+      cursor = item.next;
+    }
+    if (cursor >= fileBuffer.length) {
+      throw new Error("딕셔너리 bencode 종료(e)를 찾지 못했습니다.");
+    }
+    return {
+      value: dict,
+      next: cursor + 1,
+    };
+  }
+
+  if (token >= 0x30 && token <= 0x39) {
+    const bounds = parseBencodeStringBounds(fileBuffer, start);
+    return {
+      value: fileBuffer.slice(bounds.valueStart, bounds.valueEnd),
+      next: bounds.next,
+    };
+  }
+
+  throw new Error(`알 수 없는 bencode 토큰: ${String.fromCharCode(token)} (index: ${start})`);
+}
+
+function toUtf8String(value) {
+  if (Buffer.isBuffer(value)) {
+    return value.toString("utf8");
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return "";
+}
+
+function collectTrackers(value, out) {
+  if (!value) return;
+  if (Buffer.isBuffer(value)) {
+    const tracker = value.toString("utf8").trim();
+    if (tracker) out.push(tracker);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectTrackers(item, out);
+    }
+  }
+}
+
+function extractTorrentMetadata(fileBuffer) {
+  const infoSection = findTorrentInfoSection(fileBuffer);
+  if (!infoSection) {
+    return null;
+  }
+
+  const rootDecoded = decodeBencodeValue(fileBuffer, 0);
+  const root = rootDecoded?.value;
+  if (!root || typeof root !== "object" || Array.isArray(root) || Buffer.isBuffer(root)) {
+    return {
+      infoSection,
+      displayName: "",
+      trackers: [],
+    };
+  }
+
+  const infoDict =
+    root.info && typeof root.info === "object" && !Array.isArray(root.info) && !Buffer.isBuffer(root.info)
+      ? root.info
+      : null;
+
+  const displayName = toUtf8String(infoDict?.["name.utf-8"] || infoDict?.name).trim();
+  const trackers = [];
+  const announce = toUtf8String(root.announce).trim();
+  if (announce) {
+    trackers.push(announce);
+  }
+  collectTrackers(root["announce-list"], trackers);
+
+  return {
+    infoSection,
+    displayName,
+    trackers: [...new Set(trackers.filter(Boolean))],
+  };
+}
+
+function buildMagnetFromInfoSection(infoSection, metadata = {}) {
   if (!Buffer.isBuffer(infoSection) || infoSection.length === 0) {
     return null;
   }
+
   const infoHashHex = crypto.createHash("sha1").update(infoSection).digest("hex");
-  return `magnet:?xt=urn:btih:${infoHashHex}`;
+  const params = new URLSearchParams({
+    xt: `urn:btih:${infoHashHex}`,
+  });
+
+  const displayName = typeof metadata.displayName === "string" ? metadata.displayName.trim() : "";
+  if (displayName) {
+    params.set("dn", displayName);
+  }
+
+  const trackers = Array.isArray(metadata.trackers) ? metadata.trackers : [];
+  for (const tracker of trackers) {
+    const cleanTracker = typeof tracker === "string" ? tracker.trim() : "";
+    if (cleanTracker) {
+      params.append("tr", cleanTracker);
+    }
+  }
+
+  return `magnet:?${params.toString()}`;
 }
 
 async function buildMagnetFromTorrentBuffer(fileBuffer, debugLog) {
@@ -211,12 +361,18 @@ async function buildMagnetFromTorrentBuffer(fileBuffer, debugLog) {
   }
 
   try {
-    const infoSection = findTorrentInfoSection(fileBuffer);
-    if (!infoSection) {
+    const metadata = extractTorrentMetadata(fileBuffer);
+    if (!metadata?.infoSection) {
       errors.push("torrent info 섹션을 찾지 못했습니다.");
     } else {
-      const magnet = buildMagnetFromInfoSection(infoSection);
+      const magnet = buildMagnetFromInfoSection(metadata.infoSection, metadata);
       if (magnet) {
+        if (typeof debugLog === "function") {
+          debugLog("torrent->magnet 내장 파서 fallback", {
+            hasName: Boolean(metadata.displayName),
+            trackerCount: Array.isArray(metadata.trackers) ? metadata.trackers.length : 0,
+          });
+        }
         return magnet;
       }
       errors.push("info hash로 magnet URI를 생성하지 못했습니다.");
