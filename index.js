@@ -818,25 +818,65 @@ class SynologyDownloadStation {
 
     return this.runWithRetry(async () => {
       const { task } = await this.queryApiInfo();
-      const payload = {
-        api: "SYNO.DownloadStation.Task",
-        version: String(task.maxVersion),
-        method: "delete",
-        id: ids.join(","),
-        _sid: this.sid,
+      const joinedIds = ids.join(",");
+
+      const postDelete = async (extraPayload = {}, reason = "primary") => {
+        const payload = {
+          api: "SYNO.DownloadStation.Task",
+          version: String(task.maxVersion),
+          method: "delete",
+          id: joinedIds,
+          _sid: this.sid,
+          ...extraPayload,
+        };
+
+        this.debugLog("delete tasks attempt", {
+          reason,
+          ids: joinedIds,
+          extraPayload,
+        });
+
+        const response = await this.http.post(
+          `/webapi/${task.path}`,
+          new URLSearchParams(payload).toString(),
+          {
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+          },
+        );
+
+        this.assertHttpOk(response, "작업 삭제 실패");
+        this.debugLog("delete tasks response", response.data);
+        return response;
       };
 
-      const response = await this.http.post(
-        `/webapi/${task.path}`,
-        new URLSearchParams(payload).toString(),
-        {
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-        },
-      );
+      let response = await postDelete({}, "primary");
+      if (response.data?.success) return;
 
-      this.assertHttpOk(response, "작업 삭제 실패");
+      if (response.data?.error?.code === 101) {
+        const fallbacks = [
+          { extraPayload: { force_complete: "false" }, reason: "force_complete_false" },
+          { extraPayload: { force_complete: "true" }, reason: "force_complete_true" },
+          { extraPayload: { force_delete: "false" }, reason: "force_delete_false" },
+          { extraPayload: { force_delete: "true" }, reason: "force_delete_true" },
+          {
+            extraPayload: { force_complete: "false", force_delete: "false" },
+            reason: "force_complete_false_force_delete_false",
+          },
+          {
+            extraPayload: { force_complete: "true", force_delete: "true" },
+            reason: "force_complete_true_force_delete_true",
+          },
+        ];
+
+        for (const fallback of fallbacks) {
+          response = await postDelete(fallback.extraPayload, fallback.reason);
+          if (response.data?.success) return;
+          if (response.data?.error?.code !== 101) break;
+        }
+      }
+
       this.assertSynologySuccess(response.data, "작업 삭제 실패");
     });
   }
@@ -1048,10 +1088,12 @@ async function main() {
     const finishedTasks = (snapshot.tasks || []).filter((task) => task.status === "finished");
 
     if (finishedTasks.length === 0) {
-      return { checked: snapshot.total, removed: 0, finished: 0 };
+      return { checked: snapshot.total, removed: 0, finished: 0, failed: 0, errors: [] };
     }
 
     let removed = 0;
+    let failed = 0;
+    const errors = [];
     for (const task of finishedTasks) {
       const taskId = String(task.id || "").trim();
       if (!taskId) continue;
@@ -1065,6 +1107,8 @@ async function main() {
           title: task.title,
         });
       } catch (error) {
+        failed += 1;
+        errors.push(`${task.title || taskId}: ${error.message}`);
         synology.debugLog("auto-clean finished task remove failed", {
           trigger,
           taskId,
@@ -1073,7 +1117,7 @@ async function main() {
       }
     }
 
-    return { checked: snapshot.total, removed, finished: finishedTasks.length };
+    return { checked: snapshot.total, removed, finished: finishedTasks.length, failed, errors };
   }
 
   let autoRemoveFinishedRunning = false;
@@ -1087,6 +1131,13 @@ async function main() {
       if (result.removed > 0) {
         console.log(
           `[synology-auto-bot] auto-remove-finished removed ${result.removed} task(s) out of ${result.finished} finished task(s).`,
+        );
+      }
+      if (result.failed > 0) {
+        console.error(
+          `[synology-auto-bot] auto-remove-finished failed on ${result.failed} task(s): ${result.errors
+            .slice(0, 3)
+            .join(" | ")}`,
         );
       }
     } catch (error) {
@@ -1216,7 +1267,14 @@ async function main() {
         await ctx.reply("정리할 완료 항목이 없습니다.");
         return;
       }
-      await ctx.reply(`완료 항목 정리: ${result.removed}/${result.finished}건 삭제`);
+      const lines = [`완료 항목 정리: ${result.removed}/${result.finished}건 삭제`];
+      if (result.failed > 0) {
+        lines.push(`삭제 실패: ${result.failed}건`);
+        if (result.errors.length > 0) {
+          lines.push(`사유: ${result.errors.slice(0, 2).join(" | ")}`);
+        }
+      }
+      await ctx.reply(lines.join("\n"));
     } catch (error) {
       await ctx.reply(`완료 항목 정리 실패: ${error.message}`);
     }
