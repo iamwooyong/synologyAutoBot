@@ -35,6 +35,13 @@ function parseAllowedChatIds(raw) {
   );
 }
 
+function sleep(ms) {
+  const delay = Math.max(0, toNumber(ms, 0));
+  return new Promise((resolve) => {
+    setTimeout(resolve, delay);
+  });
+}
+
 function extractMagnets(text) {
   if (!text) return [];
   const regex = /magnet:\?xt=urn:[^\s<>"']+/gi;
@@ -486,6 +493,7 @@ class SynologyDownloadStation {
     this.password = options.password;
     this.destination = options.destination || "";
     this.torrentWatchDir = options.torrentWatchDir || "";
+    this.watchImportWaitSec = Math.max(3, toNumber(options.watchImportWaitSec, 20));
     this.allowSelfSigned = options.allowSelfSigned;
     this.sid = null;
     this.apiInfo = null;
@@ -697,20 +705,20 @@ class SynologyDownloadStation {
       const isParamError = (response) => response?.data?.error?.code === 101;
 
       let response = await postTorrentWithQuery(this.destination, "primary");
-      if (response.data?.success) return;
+      if (response.data?.success) return { method: "api_query_file" };
 
       if (this.destination && isParamError(response)) {
         response = await postTorrentWithQuery("", "retry_without_destination");
-        if (response.data?.success) return;
+        if (response.data?.success) return { method: "api_query_file_without_destination" };
       }
 
       if (isParamError(response)) {
         response = await postTorrentWithMultipart(this.destination, "fallback_multipart");
-        if (response.data?.success) return;
+        if (response.data?.success) return { method: "api_multipart" };
 
         if (this.destination && isParamError(response)) {
           response = await postTorrentWithMultipart("", "fallback_multipart_without_destination");
-          if (response.data?.success) return;
+          if (response.data?.success) return { method: "api_multipart_without_destination" };
         }
       }
 
@@ -720,12 +728,45 @@ class SynologyDownloadStation {
           filename: safeFilename,
         });
         try {
+          const beforeSnapshot = await this.getTaskSnapshot(300);
+          const beforeTaskIds = new Set(
+            (beforeSnapshot.tasks || []).map((item) => String(item.id || "").trim()).filter(Boolean),
+          );
+          let parsedMeta = null;
+          try {
+            parsedMeta = extractTorrentMetadata(fileBuffer);
+          } catch (_error) {
+            parsedMeta = null;
+          }
+          const expectedTitles = [
+            parsedMeta?.displayName,
+            safeFilename.replace(/\.torrent$/i, ""),
+            String(filename || "").replace(/\.torrent$/i, ""),
+          ]
+            .map((title) => String(title || "").trim())
+            .filter(Boolean);
+
           const savedPath = await this.enqueueTorrentFileToWatchFolder(safeFilename, fileBuffer);
           this.debugLog("watch folder enqueue success", {
             watchDir: this.torrentWatchDir,
             savedPath,
           });
-          return;
+
+          const imported = await this.waitForTaskImport({
+            beforeTaskIds,
+            expectedTitles,
+            timeoutSec: this.watchImportWaitSec,
+          });
+
+          if (imported.found) {
+            this.debugLog("watch folder import confirmed", imported);
+            return { method: "watch_folder", imported };
+          }
+
+          this.debugLog("watch folder enqueue done but no visible task imported", {
+            timeoutSec: this.watchImportWaitSec,
+            expectedTitles,
+          });
         } catch (watchError) {
           this.debugLog("watch folder enqueue failed", {
             watchDir: this.torrentWatchDir,
@@ -741,13 +782,14 @@ class SynologyDownloadStation {
         });
         try {
           await this.createTaskFromUri(magnetFallback);
-          return;
+          return { method: "magnet_fallback" };
         } catch (magnetError) {
           this.debugLog("parsed magnet fallback failed", { message: magnetError.message });
         }
       }
 
       this.assertSynologySuccess(response.data, "토렌트 파일 등록 실패");
+      return { method: "unknown" };
     });
   }
 
@@ -771,6 +813,57 @@ class SynologyDownloadStation {
     await fs.rename(tempPath, targetPath);
 
     return targetPath;
+  }
+
+  async waitForTaskImport(options = {}) {
+    const beforeTaskIds = options.beforeTaskIds || new Set();
+    const expectedTitles = Array.isArray(options.expectedTitles)
+      ? options.expectedTitles
+          .map((title) => String(title || "").trim().toLowerCase())
+          .filter(Boolean)
+      : [];
+
+    const timeoutMs = Math.max(3, toNumber(options.timeoutSec, this.watchImportWaitSec)) * 1000;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() <= deadline) {
+      const snapshot = await this.getTaskSnapshot(300);
+      const tasks = snapshot.tasks || [];
+
+      const newTask = tasks.find((task) => {
+        const taskId = String(task.id || "").trim();
+        return taskId && !beforeTaskIds.has(taskId);
+      });
+      if (newTask) {
+        return {
+          found: true,
+          reason: "new_id",
+          taskId: String(newTask.id || "").trim(),
+          title: newTask.title || "",
+        };
+      }
+
+      if (expectedTitles.length > 0) {
+        const matchedTask = tasks.find((task) => {
+          const title = String(task.title || "").trim().toLowerCase();
+          return title && expectedTitles.includes(title);
+        });
+        if (matchedTask) {
+          return {
+            found: true,
+            reason: "title_match",
+            taskId: String(matchedTask.id || "").trim(),
+            title: matchedTask.title || "",
+          };
+        }
+      }
+
+      const remain = deadline - Date.now();
+      if (remain <= 0) break;
+      await sleep(Math.min(2000, remain));
+    }
+
+    return { found: false };
   }
 
   async pauseTasks(taskIds) {
@@ -970,6 +1063,7 @@ async function main() {
     process.env.SYNOLOGY_TORRENT_WATCH_DIR === undefined
       ? "/watch"
       : String(process.env.SYNOLOGY_TORRENT_WATCH_DIR || "").trim();
+  const watchImportWaitSec = Math.max(3, toNumber(process.env.WATCH_IMPORT_WAIT_SEC, 20));
 
   const synology = new SynologyDownloadStation({
     baseUrl: getEnv("SYNOLOGY_BASE_URL"),
@@ -977,6 +1071,7 @@ async function main() {
     password: getEnv("SYNOLOGY_PASSWORD"),
     destination: process.env.SYNOLOGY_DOWNLOAD_DIR || "",
     torrentWatchDir,
+    watchImportWaitSec,
     allowSelfSigned: parseBoolean(process.env.SYNOLOGY_ALLOW_SELF_SIGNED, false),
     debug: parseBoolean(process.env.BOT_DEBUG, false),
   });
@@ -1007,6 +1102,7 @@ async function main() {
     "/help - 사용법 보기",
     "",
     `워치 폴더 fallback: ${torrentWatchDir ? `ON (${torrentWatchDir})` : "OFF"}`,
+    `워치 폴더 반영 확인 대기: ${watchImportWaitSec}초`,
     `자동 시딩 중지: ${autoStopSeeding ? "ON" : "OFF"} (주기 ${autoStopSeedingIntervalSec}초)`,
     `완료 항목 자동 정리: ${autoRemoveFinished ? "ON" : "OFF"} (주기 ${autoRemoveFinishedIntervalSec}초)`,
   ].join("\n");
@@ -1321,8 +1417,17 @@ async function main() {
           });
 
           const fileBuffer = Buffer.from(fileResponse.data);
-          await synology.createTaskFromTorrentFile(fileName, fileBuffer);
-          added.push(`토렌트 파일 1건 (${fileName})`);
+          const result = await synology.createTaskFromTorrentFile(fileName, fileBuffer);
+          const methodLabelMap = {
+            api_query_file: "API(파일)",
+            api_query_file_without_destination: "API(파일,기본경로)",
+            api_multipart: "API(멀티파트)",
+            api_multipart_without_destination: "API(멀티파트,기본경로)",
+            watch_folder: "워치폴더",
+            magnet_fallback: "마그넷 변환",
+          };
+          const methodLabel = methodLabelMap[result?.method] || result?.method || "알수없음";
+          added.push(`토렌트 파일 1건 (${fileName}, 방식: ${methodLabel})`);
         } catch (error) {
           failed.push(`토렌트 파일 가져오기 실패: ${error.message}`);
         }
