@@ -494,6 +494,7 @@ class SynologyDownloadStation {
     this.destination = options.destination || "";
     this.torrentWatchDir = options.torrentWatchDir || "";
     this.watchImportWaitSec = Math.max(3, toNumber(options.watchImportWaitSec, 20));
+    this.watchImportStrict = Boolean(options.watchImportStrict);
     this.allowSelfSigned = options.allowSelfSigned;
     this.sid = null;
     this.apiInfo = null;
@@ -767,11 +768,19 @@ class SynologyDownloadStation {
             timeoutSec: this.watchImportWaitSec,
             expectedTitles,
           });
+          if (this.watchImportStrict) {
+            throw new Error(
+              `워치 폴더에 파일은 저장됐지만 ${this.watchImportWaitSec}초 내 작업 생성이 확인되지 않았습니다.`,
+            );
+          }
         } catch (watchError) {
           this.debugLog("watch folder enqueue failed", {
             watchDir: this.torrentWatchDir,
             message: watchError.message,
           });
+          if (this.watchImportStrict) {
+            throw watchError;
+          }
         }
       }
 
@@ -1064,6 +1073,7 @@ async function main() {
       ? "/watch"
       : String(process.env.SYNOLOGY_TORRENT_WATCH_DIR || "").trim();
   const watchImportWaitSec = Math.max(3, toNumber(process.env.WATCH_IMPORT_WAIT_SEC, 20));
+  const watchImportStrict = parseBoolean(process.env.WATCH_IMPORT_STRICT, true);
 
   const synology = new SynologyDownloadStation({
     baseUrl: getEnv("SYNOLOGY_BASE_URL"),
@@ -1072,6 +1082,7 @@ async function main() {
     destination: process.env.SYNOLOGY_DOWNLOAD_DIR || "",
     torrentWatchDir,
     watchImportWaitSec,
+    watchImportStrict,
     allowSelfSigned: parseBoolean(process.env.SYNOLOGY_ALLOW_SELF_SIGNED, false),
     debug: parseBoolean(process.env.BOT_DEBUG, false),
   });
@@ -1103,6 +1114,7 @@ async function main() {
     "",
     `워치 폴더 fallback: ${torrentWatchDir ? `ON (${torrentWatchDir})` : "OFF"}`,
     `워치 폴더 반영 확인 대기: ${watchImportWaitSec}초`,
+    `워치 폴더 strict: ${watchImportStrict ? "ON" : "OFF"}`,
     `자동 시딩 중지: ${autoStopSeeding ? "ON" : "OFF"} (주기 ${autoStopSeedingIntervalSec}초)`,
     `완료 항목 자동 정리: ${autoRemoveFinished ? "ON" : "OFF"} (주기 ${autoRemoveFinishedIntervalSec}초)`,
   ].join("\n");

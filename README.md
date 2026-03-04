@@ -36,6 +36,7 @@ cp .env.example .env
 - `SYNOLOGY_TORRENT_WATCH_DIR_HOST`: NAS 워치 폴더 경로 (예: `usbshare2/torrentDown/torrent_watch`)
 - `SYNOLOGY_TORRENT_WATCH_DIR`: 컨테이너 내부 워치 폴더 경로 (기본 `/watch`)
 - `WATCH_IMPORT_WAIT_SEC`: 워치 폴더 등록 후 작업 생성 확인 대기 시간(초)
+- `WATCH_IMPORT_STRICT`: 워치 폴더 반영 실패 시 즉시 오류 반환 (`true` / `false`)
 - `SYNOLOGY_ALLOW_SELF_SIGNED`: NAS 인증서가 사설 인증서면 `true`
 - `AUTO_STOP_SEEDING`: 다운로드 완료 후 시딩 자동 중지 (`true` / `false`)
 - `AUTO_STOP_SEEDING_INTERVAL_SEC`: 시딩 상태 점검 주기(초)
