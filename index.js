@@ -473,6 +473,24 @@ function taskUploadSpeed(task) {
   return toNumber(task?.additional?.transfer?.speed_upload, 0);
 }
 
+function isCompletedTask(task) {
+  const status = String(task?.status || "").toLowerCase();
+  if (status === "finished" || status === "seeding") {
+    return true;
+  }
+
+  // Some DSM versions may move completed tasks to paused instead of finished/seeding.
+  if (status === "paused") {
+    const size = taskSize(task);
+    const downloaded = taskDownloaded(task);
+    if (size > 0 && downloaded >= size) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const ACTIVE_STATUSES = new Set([
   "waiting",
   "downloading",
@@ -1109,7 +1127,7 @@ async function main() {
     "/id - 현재 채팅 ID 확인",
     "/stat - Download Station 상태 요약",
     "/task - 다운로드 진행 상황",
-    "/clean - 완료 항목 정리",
+    "/clean - 완료/시딩 항목 정리",
     "/help - 사용법 보기",
     "",
     `워치 폴더 fallback: ${torrentWatchDir ? `ON (${torrentWatchDir})` : "OFF"}`,
@@ -1193,39 +1211,41 @@ async function main() {
 
   async function removeFinishedTasksNow(trigger = "manual") {
     const snapshot = await synology.getTaskSnapshot(300);
-    const finishedTasks = (snapshot.tasks || []).filter((task) => task.status === "finished");
+    const completedTasks = (snapshot.tasks || []).filter((task) => isCompletedTask(task));
 
-    if (finishedTasks.length === 0) {
-      return { checked: snapshot.total, removed: 0, finished: 0, failed: 0, errors: [] };
+    if (completedTasks.length === 0) {
+      return { checked: snapshot.total, removed: 0, completed: 0, failed: 0, errors: [] };
     }
 
     let removed = 0;
     let failed = 0;
     const errors = [];
-    for (const task of finishedTasks) {
+    for (const task of completedTasks) {
       const taskId = String(task.id || "").trim();
       if (!taskId) continue;
 
       try {
         await synology.deleteTasks(taskId);
         removed += 1;
-        synology.debugLog("auto-clean finished task removed", {
+        synology.debugLog("auto-clean completed task removed", {
           trigger,
           taskId,
           title: task.title,
+          status: task.status,
         });
       } catch (error) {
         failed += 1;
         errors.push(`${task.title || taskId}: ${error.message}`);
-        synology.debugLog("auto-clean finished task remove failed", {
+        synology.debugLog("auto-clean completed task remove failed", {
           trigger,
           taskId,
+          status: task.status,
           message: error.message,
         });
       }
     }
 
-    return { checked: snapshot.total, removed, finished: finishedTasks.length, failed, errors };
+    return { checked: snapshot.total, removed, completed: completedTasks.length, failed, errors };
   }
 
   let autoRemoveFinishedRunning = false;
@@ -1238,7 +1258,7 @@ async function main() {
       const result = await removeFinishedTasksNow(trigger);
       if (result.removed > 0) {
         console.log(
-          `[synology-auto-bot] auto-remove-finished removed ${result.removed} task(s) out of ${result.finished} finished task(s).`,
+          `[synology-auto-bot] auto-remove-finished removed ${result.removed} task(s) out of ${result.completed} completed task(s).`,
         );
       }
       if (result.failed > 0) {
@@ -1371,11 +1391,11 @@ async function main() {
 
     try {
       const result = await removeFinishedTasksNow("command");
-      if (result.finished === 0) {
-        await ctx.reply("정리할 완료 항목이 없습니다.");
+      if (result.completed === 0) {
+        await ctx.reply("정리할 완료/시딩 항목이 없습니다.");
         return;
       }
-      const lines = [`완료 항목 정리: ${result.removed}/${result.finished}건 삭제`];
+      const lines = [`완료/시딩 항목 정리: ${result.removed}/${result.completed}건 삭제`];
       if (result.failed > 0) {
         lines.push(`삭제 실패: ${result.failed}건`);
         if (result.errors.length > 0) {
